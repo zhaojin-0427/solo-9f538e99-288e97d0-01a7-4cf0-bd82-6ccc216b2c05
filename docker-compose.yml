@@ -1,0 +1,27 @@
+services:
+  coating-p95:
+    build: .
+    image: coating-p95:local
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /data/coating.db
+    volumes:
+      # Named volume keeps the SQLite database (and its WAL files) across
+      # container restarts.
+      - coating-data:/data
+    user: "65534:65534"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  coating-data:
