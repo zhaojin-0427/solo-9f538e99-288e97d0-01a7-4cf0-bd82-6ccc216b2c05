@@ -13,13 +13,17 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field, StrictInt, StrictStr
 
 from . import __version__, db
-from .domain import Bucket, TargetSpec, ValidationError
+from .domain import Bucket, ReconciliationError, TargetSpec, ValidationError
 from .service import (
     CoilState,
+    DayTableState,
     LineP95,
     get_coil,
+    get_day_table,
     query_p95,
     refine_bucket,
+    submit_day_table,
+    submit_day_tables_and_reports,
     submit_reports,
 )
 
@@ -70,6 +74,7 @@ class BulkReportIn(BaseModel):
     )
 
 
+
 class RefineIn(BaseModel):
     production_day: date = Field(description="该卷的生产日")
     target: TargetIn = Field(description="要被替换的当前档，按闭区间定位")
@@ -88,6 +93,83 @@ class CoilOut(BaseModel):
     production_day: date
     version: int = Field(description="该日汇总每成功提交一次加一；失败不改变")
     buckets: list[BucketOut]
+
+
+class DayTableIn(BaseModel):
+    line_id: StrictStr = Field(min_length=1, description="产线编号")
+    production_day: date = Field(description="生产日，YYYY-MM-DD")
+    buckets: list[BucketIn] = Field(
+        min_length=1,
+        description=(
+            "仪器汇成的整日分档计数，沿用卷报的闭区间整数微米分档格式。"
+            "同一日内各档互不重叠，计数为正整数。"
+        ),
+    )
+
+
+class DayTableOut(BaseModel):
+    line_id: str
+    production_day: date
+    version: int = Field(description="该产线该日仪器日表每成功提交一次加一；失败不改变")
+    buckets: list[BucketOut]
+
+
+class DayTablesAndReportsIn(BaseModel):
+    """Instrument day tables plus coil reports, written and checked together.
+
+    Lets a day table and its coil reports arrive at the same time and still be
+    accepted only when the resulting effective data pairs completely.  At least
+    one of the two lists must be non-empty; an empty request is rejected by the
+    service layer.
+    """
+
+    day_tables: list[DayTableIn] = Field(
+        default_factory=list, description="要登记或替换的仪器日表（可空）"
+    )
+    reports: list[ReportIn] = Field(
+        default_factory=list, description="要报送的卷日汇总（可空）"
+    )
+
+
+class DayTablesAndReportsOut(BaseModel):
+    day_tables: list[DayTableOut]
+    reports: list[CoilOut]
+
+
+class DayMismatchOut(BaseModel):
+    line_id: str
+    production_day: date
+    instrument_total: int = Field(description="该日仪器日表的测点总数")
+    coil_total: int = Field(description="该日全部卷报的测点总数")
+    instrument_unpaired: int = Field(
+        description="配不齐时，仪器侧最少配不上的测点数（最大配对下的剩余）"
+    )
+    coil_unpaired: int = Field(
+        description="配不齐时，卷报侧最少配不上的测点数（最大配对下的剩余）"
+    )
+
+
+class ReconciliationDetail(BaseModel):
+    message: str = Field(description="人类可读的拒收原因")
+    mismatches: list[DayMismatchOut] = Field(
+        default_factory=list, description="每条配不齐的产线与生产日"
+    )
+
+
+class ReconciliationErrorOut(BaseModel):
+    detail: ReconciliationDetail
+
+
+# Documented 422 shape for requests rejected because points cannot be paired.
+RECONCILIATION_RESPONSE = {
+    422: {
+        "model": ReconciliationErrorOut,
+        "description": (
+            "有产线生产日配不齐，整次请求退回。detail.mismatches 列出每一天及"
+            "两边各自最少配不上的测点数；其他校验错误的 422 结构可能不同。"
+        ),
+    }
+}
 
 
 class CandidateBucket(BaseModel):
@@ -134,6 +216,15 @@ def _coil_out(state: CoilState) -> CoilOut:
     )
 
 
+def _day_table_out(state: DayTableState) -> DayTableOut:
+    return DayTableOut(
+        line_id=state.line_id,
+        production_day=state.production_day,
+        version=state.version,
+        buckets=[BucketOut(lo=b.lo, hi=b.hi, count=b.count) for b in state.buckets],
+    )
+
+
 def get_conn(request: Request) -> Iterator[sqlite3.Connection]:
     conn = request.app.state.connect()
     try:
@@ -158,6 +249,8 @@ def create_app(database: str | None = None) -> FastAPI:
         description=(
             "按卷报送分档计数，用更窄子档细化；按产线与日期范围查询 P95 的"
             "最小/最大可能值，并列出需要补细分数据的卷与档。"
+            "可按产线与生产日登记、替换、查阅仪器日表，并用它核对整日卷报："
+            "两档只要有共同的整数微米值即可配对、每个点只配一次，两边都配得齐才收。"
             "P95 秩为第 ceil(0.95×测点数) 小的测值；只读日汇总（分档计数），"
             "不展开测点。"
         ),
@@ -167,6 +260,30 @@ def create_app(database: str | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.connect = lambda: db.connect(database)
+
+    @app.exception_handler(ReconciliationError)
+    async def reconciliation_error(
+        _: Request, exc: ReconciliationError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={
+                "detail": {
+                    "message": str(exc),
+                    "mismatches": [
+                        {
+                            "line_id": m.line_id,
+                            "production_day": m.production_day.isoformat(),
+                            "instrument_total": m.instrument_total,
+                            "coil_total": m.coil_total,
+                            "instrument_unpaired": m.instrument_unpaired,
+                            "coil_unpaired": m.coil_unpaired,
+                        }
+                        for m in exc.mismatches
+                    ],
+                }
+            },
+        )
 
     @app.exception_handler(ValidationError)
     async def domain_error(_: Request, exc: ValidationError) -> JSONResponse:
@@ -197,8 +314,10 @@ def create_app(database: str | None = None) -> FastAPI:
         summary="按卷号报送产线、生产日与分档计数",
         description=(
             "卷由 (产线, 生产日, 卷号) 定位。重复报送同一键会整体替换该日汇总；"
-            "分档与日汇总在同一事务中生效，任何校验失败都不会写入。"
+            "分档与日汇总在同一事务中生效，任何校验失败都不会写入。若该产线该日"
+            "已有仪器日表，则用本次改完后的整日卷报复核，配不齐整次退回。"
         ),
+        responses=RECONCILIATION_RESPONSE,
     )
     def post_report(payload: ReportIn, conn: Conn) -> CoilOut:
         state = submit_reports(
@@ -222,7 +341,10 @@ def create_app(database: str | None = None) -> FastAPI:
         description=(
             "适合一条产线一天上千卷的上报。整批在同一事务中生效：任一卷不合格，"
             "全部回滚，原数据不变。同一批内不得重复同一个 (产线, 生产日, 卷号)。"
+            "涉及的产线生产日若已有仪器日表，则用本次改完后的整日卷报复核，"
+            "任一天配不齐整批退回。"
         ),
+        responses=RECONCILIATION_RESPONSE,
     )
     def post_bulk(
         payload: Annotated[BulkReportIn, Body()], conn: Conn
@@ -242,13 +364,55 @@ def create_app(database: str | None = None) -> FastAPI:
         return [_coil_out(state) for state in states]
 
     @app.post(
+        "/day-tables/submit",
+        response_model=DayTablesAndReportsOut,
+        status_code=status.HTTP_201_CREATED,
+        summary="同时提交仪器日表与卷报（同一事务，生效后必须配得齐）",
+        description=(
+            "仪器日表与卷报可一次提交，全部写入同一事务后再核对。这样即使日表与"
+            "卷报同时到达，生效的数据也必须配得齐；任一产线生产日配不齐就整次退回，"
+            "原日表、卷报与 P95 不变。"
+        ),
+        responses=RECONCILIATION_RESPONSE,
+    )
+    def post_day_tables_and_reports(
+        payload: Annotated[DayTablesAndReportsIn, Body()], conn: Conn
+    ) -> DayTablesAndReportsOut:
+        tables, states = submit_day_tables_and_reports(
+            conn,
+            day_tables=[
+                (
+                    table.line_id,
+                    table.production_day,
+                    [b.to_domain() for b in table.buckets],
+                )
+                for table in payload.day_tables
+            ],
+            reports=[
+                (
+                    report.line_id,
+                    report.production_day,
+                    report.coil_id,
+                    [b.to_domain() for b in report.buckets],
+                )
+                for report in payload.reports
+            ],
+        )
+        return DayTablesAndReportsOut(
+            day_tables=[_day_table_out(state) for state in tables],
+            reports=[_coil_out(state) for state in states],
+        )
+
+    @app.post(
         "/reports/{line_id}/{coil_id}/refinements",
         response_model=CoilOut,
         summary="用更窄子档替换当前某一档",
         description=(
             "子档须落在原档内、彼此互不重叠，计数之和等于原档计数。新档位与日汇总"
-            "在同一事务提交；任一条不满足则整体回滚，沿用原数据。"
+            "在同一事务提交；任一条不满足则整体回滚，沿用原数据。若该产线该日已有"
+            "仪器日表，细化后还须与整日卷报配得齐，否则整次退回。"
         ),
+        responses=RECONCILIATION_RESPONSE,
     )
     def post_refinement(
         line_id: str, coil_id: str, payload: RefineIn, conn: Conn
@@ -284,6 +448,47 @@ def create_app(database: str | None = None) -> FastAPI:
         except ValidationError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return _coil_out(state)
+
+    @app.post(
+        "/day-tables",
+        response_model=DayTableOut,
+        status_code=status.HTTP_201_CREATED,
+        summary="登记或替换某产线某生产日的仪器日表",
+        description=(
+            "仪器汇成的整日分档，沿用卷报的闭区间整数微米分档格式。"
+            "写入后，该日仪器侧的全部测点必须能与该日全部卷报的测点一一配对；"
+            "两档只要有共同的整数微米值即可配对，每个点只能配一次。"
+            "配不齐则整次请求退回（422），并在 mismatches 中给出每条产线、"
+            "每一天以及两边各自最少配不上的测点数。已存在的日表、卷报、P95 不受影响。"
+        ),
+        responses=RECONCILIATION_RESPONSE,
+    )
+    def post_day_table(payload: DayTableIn, conn: Conn) -> DayTableOut:
+        state = submit_day_table(
+            conn,
+            line_id=payload.line_id,
+            production_day=payload.production_day,
+            buckets=[b.to_domain() for b in payload.buckets],
+        )
+        return _day_table_out(state)
+
+    @app.get(
+        "/day-tables/{line_id}",
+        response_model=DayTableOut,
+        summary="查看某产线某生产日的仪器日表",
+    )
+    def read_day_table(
+        line_id: str,
+        conn: Conn,
+        production_day: Annotated[date, Query(description="生产日，YYYY-MM-DD")],
+    ) -> DayTableOut:
+        try:
+            state = get_day_table(
+                conn, line_id=line_id, production_day=production_day
+            )
+        except ValidationError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return _day_table_out(state)
 
     @app.get(
         "/p95",

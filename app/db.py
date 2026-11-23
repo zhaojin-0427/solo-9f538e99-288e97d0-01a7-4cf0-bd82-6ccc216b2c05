@@ -45,6 +45,27 @@ CREATE TABLE IF NOT EXISTS buckets (
 
 CREATE INDEX IF NOT EXISTS idx_coils_day
     ON coils (line_id, production_day);
+
+CREATE TABLE IF NOT EXISTS instrument_days (
+    line_id        TEXT NOT NULL,
+    production_day TEXT NOT NULL,
+    version        INTEGER NOT NULL DEFAULT 1,
+    updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (line_id, production_day)
+);
+
+CREATE TABLE IF NOT EXISTS instrument_buckets (
+    line_id        TEXT NOT NULL,
+    production_day TEXT NOT NULL,
+    position       INTEGER NOT NULL,
+    lo             INTEGER NOT NULL,
+    hi             INTEGER NOT NULL,
+    count          INTEGER NOT NULL CHECK (count > 0),
+    PRIMARY KEY (line_id, production_day, position),
+    CHECK (lo <= hi),
+    FOREIGN KEY (line_id, production_day)
+        REFERENCES instrument_days (line_id, production_day) ON DELETE CASCADE
+);
 """
 
 DEFAULT_DATABASE_PATH = os.path.join(

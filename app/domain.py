@@ -8,7 +8,9 @@ fell into it.  Everything in this module therefore works on bucket counts.
 
 from __future__ import annotations
 
+import heapq
 from dataclasses import dataclass
+from datetime import date
 from typing import Iterable, Sequence
 
 
@@ -170,3 +172,176 @@ def p95_range(buckets: Sequence[Bucket]) -> P95Range:
     minimum = kth_value(((b.lo, b.count) for b in buckets), rank)
     maximum = kth_value(((b.hi, b.count) for b in buckets), rank)
     return P95Range(total=total, rank=rank, minimum=minimum, maximum=maximum)
+
+
+# --------------------------------------------------------------------------- #
+# Instrument day table <-> coil report reconciliation
+# --------------------------------------------------------------------------- #
+#
+# The instrument packs a whole production day into buckets; each coil report
+# packs its own points into buckets.  The two sides need not use the same
+# bucket boundaries.  A point from an instrument bucket can be paired with a
+# point from a coil bucket exactly when the two closed integer intervals share
+# at least one micrometre value; every point may be paired only once.  A day
+# reconciles only when *all* points on both sides can be paired.
+#
+# This is the maximum-cardinality matching between two multisets of intervals
+# with capacities.  It is computed by one sweep over bucket boundaries.  An
+# interval that ends first is the most constrained, so it is matched first
+# against still-open intervals of the other side.  Only per-bucket counters are
+# kept: time and extra memory are O(number of buckets), never O(points).
+
+
+@dataclass(frozen=True)
+class PairingResult:
+    """Outcome of pairing an instrument day table against coil reports."""
+
+    instrument_total: int
+    coil_total: int
+    paired: int
+
+    @property
+    def instrument_unpaired(self) -> int:
+        return self.instrument_total - self.paired
+
+    @property
+    def coil_unpaired(self) -> int:
+        return self.coil_total - self.paired
+
+    @property
+    def complete(self) -> bool:
+        return self.instrument_unpaired == 0 and self.coil_unpaired == 0
+
+
+def pair_buckets(
+    instrument: Sequence[Bucket], coils: Sequence[Bucket]
+) -> PairingResult:
+    """Maximum number of points pairable across the two bucket multisets.
+
+    Two buckets overlap when ``max(lo) <= min(hi)``, i.e. they share an integer
+    micrometre value.  ``paired`` is the size of a maximum bipartite matching
+    (a point of the instrument side matched to a distinct point of the coil
+    side).  The remaining counts on each side are the *minimum* numbers of
+    points that cannot be paired.
+
+    The sweep visits bucket starts and ends in ascending thickness order.  At a
+    coordinate where instrument buckets end, each such bucket greedily pairs
+    with the still-open coil buckets (which necessarily contain that
+    coordinate), and vice versa.  Pairing expiring buckets first is optimal:
+    they have the fewest future opportunities.  Only two heaps of bucket
+    entries plus boundary dictionaries are kept, so memory is proportional to
+    the number of buckets on both sides.
+    """
+
+    # Per coordinate and side, the bucket entries that start / end there.
+    # Each entry is ``[hi, remaining]`` and is shared between the two maps;
+    # ``remaining`` is decremented as points are paired.
+    starts: dict[int, tuple[list[list[int]], list[list[int]]]] = {}
+    ends: dict[int, tuple[list[list[int]], list[list[int]]]] = {}
+    instrument_total = 0
+    coil_total = 0
+
+    for side, buckets in ((0, instrument), (1, coils)):
+        for bucket in buckets:
+            entry = [bucket.hi, bucket.count]
+            starts.setdefault(bucket.lo, ([], []))[side].append(entry)
+            ends.setdefault(bucket.hi, ([], []))[side].append(entry)
+            if side == 0:
+                instrument_total += bucket.count
+            else:
+                coil_total += bucket.count
+
+    instrument_open: list[tuple[int, int, list]] = []
+    coil_open: list[tuple[int, int, list]] = []
+    tick = 0
+    paired = 0
+
+    def push(heap: list, entry: list) -> None:
+        nonlocal tick
+        # ``tick`` keeps heap ordering deterministic when ``hi`` ties.
+        heapq.heappush(heap, (entry[0], tick, entry))
+        tick += 1
+
+    def consume(heap: list, needed: int) -> int:
+        """Pair up to ``needed`` points from still-open opposite buckets."""
+
+        nonlocal paired
+        taken = 0
+        while needed > 0 and heap:
+            entry = heap[0][2]
+            if entry[1] <= 0:  # lazily discard exhausted entries
+                heapq.heappop(heap)
+                continue
+            amount = needed if needed < entry[1] else entry[1]
+            entry[1] -= amount
+            needed -= amount
+            taken += amount
+            if entry[1] <= 0:
+                heapq.heappop(heap)
+        paired += taken
+        return taken
+
+    coordinates = set(starts)
+    coordinates.update(ends)
+    for coordinate in sorted(coordinates):
+        beginning = starts.get(coordinate)
+        if beginning is not None:
+            for entry in beginning[0]:
+                push(instrument_open, entry)
+            for entry in beginning[1]:
+                push(coil_open, entry)
+
+        ending = ends.get(coordinate)
+        if ending is not None:
+            # Instrument buckets ending here pair with coil buckets that are
+            # still open (they started at or before this coordinate and have
+            # not ended yet, hence they contain it).
+            for entry in ending[0]:
+                if entry[1] > 0:
+                    consume(coil_open, entry[1])
+                    entry[1] = 0
+                    # ``entry`` was not necessarily at the heap front; stale
+                    # entries are skipped lazily by ``consume``.
+            for entry in ending[1]:
+                if entry[1] > 0:
+                    consume(instrument_open, entry[1])
+                    entry[1] = 0
+
+    return PairingResult(instrument_total, coil_total, paired)
+
+
+@dataclass(frozen=True)
+class DayMismatch:
+    """One (line, production day) whose instrument and coil points do not pair.
+
+    ``instrument_unpaired`` / ``coil_unpaired`` are the minimum numbers of
+    points that cannot be paired, given a maximum matching.  ``*_total`` are the
+    bucket-count totals on each side.  A day reconciles exactly when both
+    unpaired counts are zero.
+    """
+
+    line_id: str
+    production_day: date
+    instrument_total: int
+    coil_total: int
+    instrument_unpaired: int
+    coil_unpaired: int
+
+
+class ReconciliationError(ValidationError):
+    """Raised when submitted data cannot be fully paired per day table.
+
+    The whole request is rejected.  ``mismatches`` lists every affected
+    (line, production day) with the minimum unpaired counts on both sides.
+    """
+
+    def __init__(self, mismatches: Sequence[DayMismatch]):
+        self.mismatches = tuple(mismatches)
+        parts = [
+            f"line {m.line_id} on {m.production_day.isoformat()} does not reconcile: "
+            f"at least {m.instrument_unpaired} of {m.instrument_total} instrument "
+            f"point(s) and {m.coil_unpaired} of {m.coil_total} coil point(s) "
+            f"cannot be paired"
+            for m in self.mismatches
+        ]
+        super().__init__("; ".join(parts))
